@@ -1,8 +1,6 @@
 # результат работы архиватора — в git не храним
 out/
 demo_out/
-tests/_tmp_out/
-tests/_tmp_img/
-tests/_tmp_img2/
+tests/_tmp*/
 *.epub
 __pycache__/

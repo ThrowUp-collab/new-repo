@@ -362,6 +362,10 @@ class TestCliRobustness(unittest.TestCase):
 
     out = os.path.join(ROOT, "tests", "_tmp_cli")
 
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.out, ignore_errors=True)
+
     def test_no_args_prints_help_not_argparse_error(self):
         import io as _io, contextlib
         buf = _io.StringIO()
@@ -528,6 +532,11 @@ class TestFromSavedHtml(unittest.TestCase):
             with open(os.path.join(self.src, "page-9-blocked.html"), "w",
                       encoding="utf-8") as fh:
                 fh.write(stub)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.src, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
 
     def run_tool(self, extra=()):
         argv = ["--from-html", self.src, "--out", self.out, "--delay", "0",
