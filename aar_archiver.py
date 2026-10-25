@@ -250,6 +250,12 @@ class HttpClient:
         return url, self._raw_get(url, referer=referer)
 
     def get_binary(self, url: str, referer: Optional[str] = None) -> bytes:
+        """Картинка. В режиме wayback сначала пробуем архив, потом напрямую."""
+        if self.source == "wayback":
+            try:
+                return self._raw_get(self.wayback_url(url))
+            except FetchError:
+                pass
         return self._raw_get(url, referer=referer)
 
 
@@ -429,20 +435,49 @@ def detect_title(html_text: str) -> str:
     return re.sub(r"\s*\|\s*Paradox Interactive Forums\s*$", "", txt).strip()
 
 
-BLOCK_MARKERS = (
-    "cf-browser-verification", "cf-challenge-running", "Just a moment",
-    "Attention Required", "Access denied", "you have been blocked",
-    "Enable JavaScript and cookies to continue", "Checking your browser",
-    "DDoS protection by", "captcha",
+# (название защиты, маркеры в HTML). Порядок важен: первый совпавший побеждает.
+BLOCK_SIGNATURES = (
+    ("ZeeBotGuard", ("zeebotguard", "bot-guard", "validating browser",
+                     "bootstrapinterstitial", "fallbackchallengeurl",
+                     "collectortoken")),
+    ("Cloudflare", ("cf-browser-verification", "cf-challenge-running",
+                    "just a moment", "attention required",
+                    "ddos protection by", "checking your browser")),
+    ("Anti-bot", ("enable javascript and cookies to continue",
+                  "you have been blocked", "access denied",
+                  "unusual traffic", "are you a robot", "captcha",
+                  "please enable javascript")),
 )
+
+BLOCK_MARKERS = tuple(m for _, ms in BLOCK_SIGNATURES for m in ms)
+
+
+def block_kind(html_text: str) -> str:
+    """Какая именно антибот-заглушка вместо треда (пустая строка — всё хорошо)."""
+    if "message--post" in html_text or 'class="bbWrapper"' in html_text:
+        return ""
+    head = html_text[:8000].lower()
+    for name, markers in BLOCK_SIGNATURES:
+        if any(m in head for m in markers):
+            return name
+    # совсем короткая страница без постов — тоже подозрительна
+    return "Unknown" if len(html_text) < 20000 and "<html" in head else ""
 
 
 def looks_blocked(html_text: str) -> bool:
-    """Похоже на страницу-заглушку Cloudflare/антибота, а не на тред."""
-    head = html_text[:4000].lower()
-    if "message--post" in html_text:
-        return False
-    return any(m.lower() in head for m in BLOCK_MARKERS)
+    """Похоже на страницу-заглушку антибота, а не на тред."""
+    return bool(block_kind(html_text))
+
+
+def detect_canonical(html_text: str) -> str:
+    """Канонический URL страницы — из неё правильно резолвить относительные ссылки."""
+    for pat in (r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"',
+                r'<link[^>]+href="([^"]+)"[^>]+rel="canonical"',
+                r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"'):
+        m = re.search(pat, html_text, re.I)
+        if m:
+            return html_mod.unescape(m.group(1)).strip()
+    return ""
 
 
 def detect_starter(html_text: str) -> str:
@@ -684,6 +719,12 @@ class ImageStore:
             self.failed.append(absolute)
             if not self.quiet:
                 warn("картинка не скачалась: %s" % exc)
+            return absolute
+        if block_kind(blob[:8000].decode("utf-8", "replace")):
+            # вместо картинки антибот отдал свою заглушку
+            self.failed.append(absolute)
+            if not self.quiet:
+                warn("вместо картинки — заглушка антибота: %s" % absolute)
             return absolute
         digest = hashlib.sha1(blob).hexdigest()[:12]
         name = "%s-%s%s" % (digest, sanitize_name(absolute),
@@ -1194,6 +1235,176 @@ def parse_pages_spec(spec: str, last_page: int) -> List[int]:
     return sorted(set(p for p in pages if 1 <= p <= max(last_page, 1)))
 
 
+@dataclass
+class PageSet:
+    html: Dict[int, str] = field(default_factory=dict)
+    bases: Dict[int, str] = field(default_factory=dict)
+    wanted: List[int] = field(default_factory=list)
+    blocked: str = ""       # текст заглушки антибота, если её отдали вместо треда
+    blocked_kind: str = ""
+
+
+def saved_html_files(dirpath: str) -> List[str]:
+    out = []
+    for root, _, files in os.walk(dirpath):
+        for name in sorted(files):
+            if name.lower().endswith((".html", ".htm", ".xhtml")):
+                out.append(os.path.join(root, name))
+    return sorted(out)
+
+
+def page_number_from_name(path: str, fallback: int) -> int:
+    base = os.path.basename(path)
+    m = re.search(r"(?:page|part|страница)[-_ .]?(\d+)", base, re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)", base)
+    return int(m.group(1)) if m else fallback
+
+
+def load_pages_from_dir(dirpath: str, thread: Thread, args) -> PageSet:
+    """Разбор страниц, сохранённых браузером. Сеть для HTML не нужна вовсе."""
+    pages = PageSet()
+    files = saved_html_files(dirpath)
+    if not files:
+        raise FetchError(dirpath, RuntimeError("в папке нет .html-файлов"))
+    log("Читаю сохранённые страницы: %s (файлов: %d)" % (dirpath, len(files)))
+    for i, path in enumerate(files, start=1):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        kind = block_kind(text)
+        if kind and "message--post" not in text:
+            warn("%s — это заглушка антибота (%s), пропускаю" % (os.path.basename(path), kind))
+            continue
+        num = page_number_from_name(path, i)
+        base = detect_canonical(text) or thread.url \
+            or "file://" + urllib.parse.quote(os.path.abspath(path))
+        pages.html[num] = text
+        pages.bases[num] = base
+        if not thread.url.startswith("http") and base.startswith("http"):
+            hint = split_thread_url(base)
+            thread.url, thread.slug, thread.thread_id = base, hint.slug, hint.thread_id
+        if not thread.title:
+            thread.title = detect_title(text)
+        if not thread.starter:
+            thread.starter = detect_starter(text)
+        log("  %s -> страница %d" % (os.path.basename(path), num))
+    pages.wanted = sorted(pages.html)
+    thread.last_page = max(pages.wanted) if pages.wanted else 1
+    return pages
+
+
+def _save_raw(raw_dir: str, page: int, text: str) -> None:
+    with open(os.path.join(raw_dir, "page-%03d.html" % page), "w",
+              encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def load_pages_from_net(args, thread: Thread, client: HttpClient,
+                        raw_dir: str) -> PageSet:
+    pages = PageSet()
+
+    def grab(page: int) -> str:
+        url = page_url(thread.url, page)
+        try:
+            _, body = client.get_page(url, referer=thread.url)
+            return body.decode("utf-8", "replace")
+        except FetchError:
+            if client.source != "wayback":
+                if not args.quiet:
+                    warn("нет с форума, пробую web.archive.org (страница %d)" % page)
+                old = client.source
+                client.source = "wayback"
+                try:
+                    _, body = client.get_page(url)
+                    return body.decode("utf-8", "replace")
+                finally:
+                    client.source = old
+            raise
+
+    log("Страница 1/? …")
+    try:
+        text = grab(1)
+    except FetchError as exc:
+        warn(str(exc))
+        raise
+    _save_raw(raw_dir, 1, text)
+    pages.html[1] = text
+    pages.bases[1] = thread.url
+
+    kind = block_kind(text)
+    if kind:
+        pages.blocked, pages.blocked_kind = text, kind
+        pages.wanted = [1]
+        thread.last_page = 1
+        return pages
+
+    thread.title = detect_title(text)
+    thread.starter = detect_starter(text)
+    canonical = detect_canonical(text)
+    if canonical and not thread.thread_id:
+        hint = split_thread_url(canonical)
+        thread.slug, thread.thread_id = hint.slug, hint.thread_id
+    thread.last_page = detect_last_page(text, thread.url)
+    if args.max_pages:
+        thread.last_page = min(thread.last_page, args.max_pages)
+
+    log("Тред: %s" % (thread.title or "(без названия)"))
+    log("Автор: %s · страниц: %d · id %s"
+        % (thread.starter or "?", thread.last_page, thread.thread_id or "?"))
+
+    wanted = parse_pages_spec(args.pages, thread.last_page) if args.pages \
+        else list(range(1, thread.last_page + 1))
+    pages.wanted = wanted
+    log("Качаю страницы: %d-%d (всего %d)" % (wanted[0], wanted[-1], len(wanted)))
+
+    for page in wanted:
+        if page == 1:
+            continue
+        if args.resume:
+            cached = os.path.join(raw_dir, "page-%03d.html" % page)
+            if os.path.exists(cached):
+                with open(cached, "r", encoding="utf-8") as fh:
+                    pages.html[page] = fh.read()
+                pages.bases[page] = thread.url
+                log("Страница %d/%d … (из кэша)" % (page, thread.last_page))
+                continue
+        log("Страница %d/%d …" % (page, thread.last_page))
+        try:
+            text = grab(page)
+        except FetchError as exc:
+            warn(str(exc))
+            continue
+        _save_raw(raw_dir, page, text)
+        pages.html[page] = text
+        pages.bases[page] = thread.url
+        if block_kind(text):
+            warn("страница %d — заглушка антибота, постов с неё не будет" % page)
+    return pages
+
+
+def blocked_guidance(kind: str, thread_url: str) -> None:
+    """Что делать, если форум отдал антибот-заглушку. Без взлома защиты."""
+    warn("вместо треда форум отдал страницу проверки бота: %s." % (kind or "антибот"))
+    warn("это JS-проверка, обычный HTTP-запрос её не проходит — и обходить")
+    warn("её в обход правил форума скрипт не будет. Три рабочих пути:")
+    warn("")
+    warn("1) Сохранить страницы браузером и разобрать их офлайн (надёжнее всего):")
+    warn("     в браузере на каждой странице треда: Ctrl+S -> «только HTML»,")
+    warn("     всё в одну папку, затем")
+    warn('       python3 aar_archiver.py --from-html "папка" --out "Siberian Prosperity"')
+    warn("")
+    warn("2) Передать куки своего браузера — вы-то проверку уже прошли:")
+    warn("     DevTools (F12) -> Network -> запрос к форуму -> Request Headers -> Cookie")
+    warn("       python3 aar_archiver.py %s \\" % (thread_url or "<url>"))
+    warn("         --cookies 'скопированная строка' --ua '<ваш User-Agent из тех же заголовков>'")
+    warn("     User-Agent обязан совпадать с браузером, иначе проверка сработает снова.")
+    warn("")
+    warn("3) Взять снимки из web.archive.org — форум вообще не трогаем:")
+    warn("       python3 aar_archiver.py %s --source wayback" % (thread_url or "<url>"))
+    warn("     Покрыты не все страницы, зато работает без входа и без проверки.")
+
+
 def archive(args: argparse.Namespace) -> int:
     thread = split_thread_url(args.thread)
     out_dir = os.path.abspath(args.out)
@@ -1210,78 +1421,32 @@ def archive(args: argparse.Namespace) -> int:
     store = ImageStore(client, img_dir, download=not args.no_images,
                        inline=args.inline_images, quiet=args.quiet)
 
-    # 1. первая страница: заголовок, автор, число страниц
-    log("Страница 1/%s …" % "?")
-    try:
-        first_url, first_html = client.get_page(page_url(thread.url, 1))
-    except FetchError as exc:
-        warn(str(exc))
-        if args.source == "forum":
-            log("Пробую через web.archive.org …")
-            client.source = "wayback"
-            first_url, first_html = client.get_page(page_url(thread.url, 1))
-        else:
+    # 1. страницы: либо качаем, либо разбираем сохранённые браузером
+    if args.from_html:
+        pages = load_pages_from_dir(os.path.abspath(args.from_html), thread, args)
+    else:
+        if not thread.url.startswith("http"):
+            warn("нужен URL треда (или --from-html с сохранёнными страницами)")
+            return 1
+        try:
+            pages = load_pages_from_net(args, thread, client, raw_dir)
+        except FetchError:
             return 2
-    first_text = first_html.decode("utf-8", "replace")
-    with open(os.path.join(raw_dir, "page-001.html"), "w", encoding="utf-8") as fh:
-        fh.write(first_text)
+        if pages.blocked:
+            blocked_guidance(pages.blocked_kind, thread.url)
+            return 5
 
-    thread.title = detect_title(first_text)
-    thread.starter = detect_starter(first_text)
-    thread.last_page = detect_last_page(first_text, thread.url)
-    if args.max_pages:
-        thread.last_page = min(thread.last_page, args.max_pages)
+    if args.from_html:
+        log("Тред: %s" % (thread.title or "(без названия)"))
+        log("Автор: %s · страниц в папке: %d"
+            % (thread.starter or "?", len(pages.wanted)))
 
-    log("Тред: %s" % (thread.title or "(без названия)"))
-    log("Автор: %s · страниц: %d · id %s"
-        % (thread.starter or "?", thread.last_page, thread.thread_id or "?"))
-
-    wanted = parse_pages_spec(args.pages, thread.last_page) if args.pages \
-        else list(range(1, thread.last_page + 1))
-    log("Качаю страницы: %d-%d (всего %d)" % (wanted[0], wanted[-1], len(wanted)))
-
+    pages_html = pages.html
     all_posts: List[Post] = []
-    pages_html: Dict[int, str] = {1: first_text}
-    for page in wanted:
-        if page != 1:
-            if args.resume:
-                cached = os.path.join(raw_dir, "page-%03d.html" % page)
-                if os.path.exists(cached):
-                    with open(cached, "r", encoding="utf-8") as fh:
-                        pages_html[page] = fh.read()
-                    log("Страница %d/%d … (из кэша)" % (page, thread.last_page))
-                    continue
-            log("Страница %d/%d …" % (page, thread.last_page))
-            try:
-                _, body = client.get_page(page_url(thread.url, page),
-                                          referer=thread.url)
-                text = body.decode("utf-8", "replace")
-                pages_html[page] = text
-                with open(os.path.join(raw_dir, "page-%03d.html" % page), "w",
-                          encoding="utf-8") as fh:
-                    fh.write(text)
-            except FetchError as exc:
-                warn(str(exc))
-                if args.source == "forum":
-                    warn("пробую wayback для страницы %d" % page)
-                    try:
-                        client.source = "wayback"
-                        _, body = client.get_page(page_url(thread.url, page))
-                        text = body.decode("utf-8", "replace")
-                        pages_html[page] = text
-                        with open(os.path.join(raw_dir, "page-%03d.html" % page), "w",
-                                  encoding="utf-8") as fh:
-                            fh.write(text)
-                    except FetchError as exc2:
-                        warn(str(exc2))
-                    finally:
-                        client.source = "forum"
-                else:
-                    continue
 
     # 2. разбор постов
     seen: set = set()
-    for page in wanted:
+    for page in pages.wanted:
         text = pages_html.get(page)
         if not text:
             continue
@@ -1303,13 +1468,15 @@ def archive(args: argparse.Namespace) -> int:
         p.is_op = bool(thread.starter) and p.author == thread.starter
 
     if not all_posts:
-        if looks_blocked(first_text):
-            warn("форум отдал страницу-заглушку антибота (Cloudflare), а не тред.")
-            warn("варианты: --cookies 'xf_user=…' из браузера, --delay 5,")
-            warn("          либо --source wayback (снимки web.archive.org).")
+        if pages.blocked:
+            blocked_guidance(pages.blocked_kind, thread.url)
+            return 5
+        warn("не нашёл ни одного поста: страницы не похожи на тред XenForo "
+             "(нужен вход?) или вёрстка форума изменилась.")
+        if args.from_html:
+            warn("проверьте, что сохраняли именно страницу треда, а не список форума,")
+            warn("и что при сохранении выбран тип «Веб-страница, только HTML».")
         else:
-            warn("не нашёл ни одного поста: страница не похожа на тред XenForo "
-                 "(нужен вход?) или вёрсткафорума изменилась.")
             warn("загляните в raw/page-001.html и в archiver.log рядом с ним.")
         return 3
 
@@ -1319,7 +1486,7 @@ def archive(args: argparse.Namespace) -> int:
     for p in all_posts:
         root = build_tree(p.body_html)
         strip_noise(root)
-        purl = page_url(thread.url, p.page)
+        purl = pages.bases.get(p.page) or page_url(thread.url, p.page)
         p.images = localize_tree(root, store, purl)
         p.body_html = to_xhtml(root)
 
@@ -1416,6 +1583,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("-o", "--out", default="out", help="папка для копии (default: out)")
     ap.add_argument("--pages", default="", help="например 1-5 или 1,3,7-9")
     ap.add_argument("--max-pages", type=int, default=0, help="не идти дальше этой страницы")
+    ap.add_argument("--from-html", default="", metavar="DIR",
+                    help="не качать с форума, а разобрать .html, сохранённые браузером "
+                         "(обходит антибот-проверку: страницы сохраняете вы сами)")
     ap.add_argument("--source", choices=("forum", "wayback"), default="forum",
                     help="forum (default) или wayback — брать снимки web.archive.org")
     ap.add_argument("--wayback-ts", default="2",
@@ -1445,19 +1615,27 @@ def build_argparser() -> argparse.ArgumentParser:
     return ap
 
 
+def open_log(path: str):
+    """Один файл лога на stdout и stderr — иначе шапка дублируется."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fh = open(path, "a", encoding="utf-8")
+        fh.write("\n=== запуск %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        fh.flush()
+        return fh
+    except OSError as exc:
+        warn("лог %s не завёлся: %s" % (path, exc))
+        return None
+
+
 class Tee:
     """Дублирует вывод в файл, чтобы сообщение не потерялось вместе с окном."""
 
-    def __init__(self, stream, path: Optional[str]) -> None:
+    def __init__(self, stream, fh=None) -> None:
         self.stream = stream
-        self.fh = None
-        if path:
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                self.fh = open(path, "a", encoding="utf-8")
-                self.fh.write("\n=== запуск %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-            except OSError:
-                self.fh = None
+        self.fh = fh
 
     def write(self, data):
         self.stream.write(data)
@@ -1479,14 +1657,6 @@ class Tee:
 
     def isatty(self):
         return self.stream.isatty()
-
-    def close(self):
-        if self.fh:
-            try:
-                self.fh.close()
-            except OSError:
-                pass
-
 
 def interactive_args() -> List[str]:
     """Запуск двойным кликом: спрашиваем URL, а не роняемся с ошибкой argparse."""
@@ -1512,17 +1682,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if own_argv and len(sys.argv) == 1 and sys.stdin.isatty():
         argv = interactive_args()
     args = ap.parse_args(argv)
-    if not (args.thread or "").strip():
+    if not (args.thread or "").strip() and not args.from_html:
         ap.print_help()
         print("\nНе указана ссылка на тред. Пример:\n  python3 aar_archiver.py %s"
               % "https://forum.paradoxplaza.com/forum/threads/<slug>.<id>/")
         return pause_on_exit(1, quiet=args.quiet)
-    tee_out = tee_err = None
+    tee_out = tee_err = log_fh = None
     if not args.no_log:
         log_path = os.path.join(os.path.abspath(args.out), "archiver.log")
         tee_out, tee_err = sys.stdout, sys.stderr
-        sys.stdout = Tee(tee_out, log_path)
-        sys.stderr = Tee(tee_err, log_path)
+        log_fh = open_log(log_path)
+        sys.stdout = Tee(tee_out, log_fh)
+        sys.stderr = Tee(tee_err, log_fh)
     try:
         try:
             rc = archive(args)
@@ -1534,9 +1705,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rc = 4
     finally:
         if tee_out is not None:
-            sys.stdout.close()
-            sys.stderr.close()
             sys.stdout, sys.stderr = tee_out, tee_err
+            sys.stdout.flush()
+            sys.stderr.flush()
+            if log_fh:
+                try:
+                    log_fh.close()
+                except OSError:
+                    pass
     if own_argv:
         rc = pause_on_exit(rc, quiet=args.quiet)
     return rc

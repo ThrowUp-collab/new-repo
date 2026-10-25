@@ -26,6 +26,7 @@ import aar_archiver as A  # noqa: E402
 
 FIXTURES = os.path.join(HERE, "fixtures")
 THREAD_URL = "https://forum.example.test/forum/threads/sample-realm-diary.900101/"
+BLOCKED_URL = "https://forum.example.test/forum/threads/blocked-diary.9999/"
 
 # минимальный валидный PNG 1x1 (красный пиксель)
 PNG_1PX = base64.b64decode(
@@ -67,8 +68,13 @@ class FakeNetwork:
             "https://forum.example.test/forum/attachments/shot2.12345/": PNG_1PX,
         }
         self.missing = {"https://i.example.org/gone.jpg"}
+        self.guarded = {"https://i.example.org/guarded.png"}
+        with open(os.path.join(FIXTURES, "blocked-botguard.html"), "rb") as fh:
+            self.stub = fh.read()
 
     def page_bytes(self, url):
+        if url.rstrip("/").endswith("9999") or "blocked-diary" in url:
+            return self.stub
         if url.rstrip("/").endswith("900101"):
             return self.pages[1]
         m = __import__("re").search(r"page-(\d+)", url)
@@ -84,6 +90,8 @@ class FakeNetwork:
             return self.images[url]
         if url in self.missing:
             raise A.FetchError(url, RuntimeError("404"))
+        if url in self.guarded:
+            return self.stub          # вместо картинки — заглушка антибота
         return self.page_bytes(url)
 
     def patch(self, client):
@@ -410,7 +418,8 @@ class TestCliRobustness(unittest.TestCase):
         self.assertTrue(os.path.exists(path))
         with open(path, encoding="utf-8") as fh:
             body = fh.read()
-        self.assertIn("=== запуск", body)
+        self.assertEqual(body.count("=== запуск"), 1,
+                         "stdout и stderr должны писать в один лог с одной шапкой")
         self.assertIn("Страница", body)
         shutil.rmtree(self.out, ignore_errors=True)
 
@@ -428,15 +437,147 @@ class TestCliRobustness(unittest.TestCase):
         self.assertEqual(A.pause_on_exit(3), 3)
 
 
-class TestBlockedPageDetection(unittest.TestCase):
-    def test_cloudflare_stub_detected(self):
-        stub = ("<html><head><title>Attention Required! | Cloudflare</title></head>"
-                "<body>Enable JavaScript and cookies to continue</body></html>")
-        self.assertTrue(A.looks_blocked(stub))
-
-    def test_real_thread_not_flagged(self):
+class TestCanonical(unittest.TestCase):
+    def test_canonical_link(self):
         with open(os.path.join(FIXTURES, "page-1.html"), encoding="utf-8") as fh:
-            self.assertFalse(A.looks_blocked(fh.read()))
+            self.assertEqual(A.detect_canonical(fh.read()), THREAD_URL.rstrip("/") + "/")
+
+    def test_og_url_fallback(self):
+        self.assertEqual(
+            A.detect_canonical('<meta property="og:url" content="https://x.test/t.1/">'),
+            "https://x.test/t.1/")
+
+    def test_no_canonical(self):
+        self.assertEqual(A.detect_canonical("<html><body>x</body></html>"), "")
+
+
+class TestBotGuardHandling(unittest.TestCase):
+    """Форум отдаёт JS-заглушку ZeeBotGuard: не молчать и не ломиться напролом."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(FIXTURES, "blocked-botguard.html"),
+                  encoding="utf-8") as fh:
+            cls.stub = fh.read()
+
+    def test_detects_zeebotguard(self):
+        self.assertEqual(A.block_kind(self.stub), "ZeeBotGuard")
+        self.assertTrue(A.looks_blocked(self.stub))
+
+    def test_detects_cloudflare(self):
+        cf = "<html><head><title>Just a moment...</title></head><body>" \
+             "<div id=cf-browser-verification>Checking your browser</div></body></html>"
+        self.assertEqual(A.block_kind(cf), "Cloudflare")
+
+    def test_real_thread_not_blocked(self):
+        with open(os.path.join(FIXTURES, "page-1.html"), encoding="utf-8") as fh:
+            self.assertEqual(A.block_kind(fh.read()), "")
+
+    def test_run_reports_and_gives_actionable_exit(self):
+        import io as _io, contextlib, shutil
+        out = os.path.join(ROOT, "tests", "_tmp_blocked")
+        shutil.rmtree(out, ignore_errors=True)
+        buf_out, buf_err = _io.StringIO(), _io.StringIO()
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            rc = A.main([BLOCKED_URL, "--out", out, "--delay", "0", "--quiet"])
+        text = buf_out.getvalue() + buf_err.getvalue()
+        self.assertEqual(rc, 5)
+        self.assertIn("ZeeBotGuard", text)
+        # все три способа должны быть подсказаны
+        self.assertIn("--from-html", text)
+        self.assertIn("--cookies", text)
+        self.assertIn("--source wayback", text)
+        # и заглушка сохранена для разбора
+        self.assertTrue(os.path.exists(os.path.join(out, "raw", "page-001.html")))
+        shutil.rmtree(out, ignore_errors=True)
+
+    def test_guarded_image_counted_as_failure(self):
+        client, net = make_client()
+        out = os.path.join(ROOT, "tests", "_tmp_guard_img")
+        store = A.ImageStore(client, out, quiet=True)
+        root = A.build_tree('<img src="https://i.example.org/guarded.png">')
+        A.localize_tree(root, store, THREAD_URL)
+        self.assertEqual(store.failed, ["https://i.example.org/guarded.png"])
+        self.assertEqual(os.listdir(out), [])
+        import shutil
+        shutil.rmtree(out, ignore_errors=True)
+
+
+class TestFromSavedHtml(unittest.TestCase):
+    """--from-html: разбор страниц, сохранённых браузером, вообще без сети."""
+
+    src = os.path.join(ROOT, "tests", "_tmp_saved")
+    out = os.path.join(ROOT, "tests", "_tmp_fromhtml")
+
+    def prepare(self, skip_blocked=False):
+        import shutil
+        shutil.rmtree(self.src, ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+        os.makedirs(self.src)
+        for n in (1, 2, 3):
+            with open(os.path.join(FIXTURES, "page-%d.html" % n), encoding="utf-8") as fh:
+                body = fh.read()
+            with open(os.path.join(self.src, "saved-page-%d.html" % n), "w",
+                      encoding="utf-8") as fh:
+                fh.write(body)
+        if not skip_blocked:
+            # заглушка антибота среди сохранённых страниц должна пропускаться
+            with open(os.path.join(FIXTURES, "blocked-botguard.html"),
+                      encoding="utf-8") as fh:
+                stub = fh.read()
+            with open(os.path.join(self.src, "page-9-blocked.html"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(stub)
+
+    def run_tool(self, extra=()):
+        argv = ["--from-html", self.src, "--out", self.out, "--delay", "0",
+                "--quiet"] + list(extra)
+        rc = A.main(argv)
+        self.assertEqual(rc, 0, "архиватор вернул %s" % rc)
+        with open(os.path.join(self.out, "posts.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_parses_saved_pages(self):
+        self.prepare()
+        data = self.run_tool(["--formats", "json,html"])
+        self.assertEqual(len(data["posts"]), 5)
+        self.assertEqual([p["page"] for p in data["posts"]], [1, 1, 2, 2, 3])
+        # заголовок и автор подтянулись из сохранённых страниц
+        self.assertEqual(data["thread"]["title"],
+                         "Sample Realm Diary - an Economic Test AAR")
+        self.assertEqual(data["thread"]["starter"], "SampleAuthor")
+        # заглушка антибота не попала в копию
+        self.assertNotIn("ZeeBotGuard", json.dumps(data))
+        self.assertFalse(any("Validating browser" in p["html"] for p in data["posts"]))
+
+    def test_images_localized_via_canonical(self):
+        self.prepare()
+        data = self.run_tool(["--formats", "json"])
+        self.assertTrue(any(p["images"] for p in data["posts"]))
+        self.assertTrue(os.listdir(os.path.join(self.out, "images")))
+        # относительная ссылка на вложение разрезолвилась по canonical, а не по file://
+        self.assertTrue(any("shot2" in os.path.basename(f)
+                            for f in os.listdir(os.path.join(self.out, "images"))))
+
+    def test_no_thread_url_needed(self):
+        self.prepare(skip_blocked=True)
+        data = self.run_tool(["--formats", "json"])
+        self.assertTrue(data["thread"]["url"].startswith("https://"))
+
+    def test_empty_dir_fails_clearly(self):
+        import shutil, io as _io, contextlib
+        shutil.rmtree(self.src, ignore_errors=True)
+        os.makedirs(self.src)
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = A.main(["--from-html", self.src, "--out", self.out, "--quiet"])
+        self.assertEqual(rc, 4)
+        shutil.rmtree(self.src, ignore_errors=True)
+
+    def test_op_only_with_saved_html(self):
+        self.prepare(skip_blocked=True)
+        data = self.run_tool(["--op-only", "--formats", "json"])
+        self.assertEqual([p["author"] for p in data["posts"]], ["SampleAuthor"] * 3)
 
 
 class TestWayback(unittest.TestCase):
