@@ -349,6 +349,96 @@ class TestEndToEnd(unittest.TestCase):
         self.assertFalse(any(u.endswith("page-2") for u in NET.requested[n_before:]))
 
 
+class TestCliRobustness(unittest.TestCase):
+    """Окно консоли не должно закрываться молча и без внятного сообщения."""
+
+    out = os.path.join(ROOT, "tests", "_tmp_cli")
+
+    def test_no_args_prints_help_not_argparse_error(self):
+        import io as _io, contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = A.main([])
+        text = buf.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("usage:", text)
+        self.assertIn("--op-only", text)
+        self.assertNotIn("the following arguments are required", text)
+
+    def test_missing_url_in_argv_still_reports_cleanly(self):
+        import io as _io, contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = A.main(["--epub"])
+        self.assertEqual(rc, 1)
+        self.assertIn("usage:", buf.getvalue())
+
+    def test_interactive_args_reads_url_and_flags(self):
+        import builtins, io as _io, contextlib
+        answers = iter([THREAD_URL, "--op-only --epub"])
+        orig = builtins.input
+        builtins.input = lambda prompt="": next(answers)
+        try:
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                argv = A.interactive_args()
+        finally:
+            builtins.input = orig
+        self.assertEqual(argv[0], THREAD_URL)
+        self.assertIn("--op-only", argv)
+        self.assertIn("--epub", argv)
+        self.assertIn("aar_archiver", buf.getvalue())
+
+    def test_interactive_args_empty_input(self):
+        import builtins, io as _io, contextlib
+        orig = builtins.input
+        builtins.input = lambda prompt="": "   "
+        try:
+            with contextlib.redirect_stdout(_io.StringIO()):
+                self.assertEqual(A.interactive_args(), [])
+        finally:
+            builtins.input = orig
+
+    def test_log_file_written(self):
+        import shutil, io as _io, contextlib
+        shutil.rmtree(self.out, ignore_errors=True)
+        with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
+            rc = A.main([THREAD_URL, "--out", self.out, "--delay", "0",
+                         "--quiet", "--formats", "json"])
+        self.assertEqual(rc, 0)
+        path = os.path.join(self.out, "archiver.log")
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("=== запуск", body)
+        self.assertIn("Страница", body)
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_no_log_flag(self):
+        import shutil, io as _io, contextlib
+        shutil.rmtree(self.out, ignore_errors=True)
+        with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
+            A.main([THREAD_URL, "--out", self.out, "--delay", "0",
+                    "--quiet", "--no-log", "--formats", "json"])
+        self.assertFalse(os.path.exists(os.path.join(self.out, "archiver.log")))
+        shutil.rmtree(self.out, ignore_errors=True)
+
+    def test_pause_skipped_when_not_tty(self):
+        self.assertEqual(A.pause_on_exit(0), 0)
+        self.assertEqual(A.pause_on_exit(3), 3)
+
+
+class TestBlockedPageDetection(unittest.TestCase):
+    def test_cloudflare_stub_detected(self):
+        stub = ("<html><head><title>Attention Required! | Cloudflare</title></head>"
+                "<body>Enable JavaScript and cookies to continue</body></html>")
+        self.assertTrue(A.looks_blocked(stub))
+
+    def test_real_thread_not_flagged(self):
+        with open(os.path.join(FIXTURES, "page-1.html"), encoding="utf-8") as fh:
+            self.assertFalse(A.looks_blocked(fh.read()))
+
+
 class TestWayback(unittest.TestCase):
     def test_wayback_url_uses_cdx(self):
         client, net = make_client(source="wayback")

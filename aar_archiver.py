@@ -429,6 +429,22 @@ def detect_title(html_text: str) -> str:
     return re.sub(r"\s*\|\s*Paradox Interactive Forums\s*$", "", txt).strip()
 
 
+BLOCK_MARKERS = (
+    "cf-browser-verification", "cf-challenge-running", "Just a moment",
+    "Attention Required", "Access denied", "you have been blocked",
+    "Enable JavaScript and cookies to continue", "Checking your browser",
+    "DDoS protection by", "captcha",
+)
+
+
+def looks_blocked(html_text: str) -> bool:
+    """Похоже на страницу-заглушку Cloudflare/антибота, а не на тред."""
+    head = html_text[:4000].lower()
+    if "message--post" in html_text:
+        return False
+    return any(m.lower() in head for m in BLOCK_MARKERS)
+
+
 def detect_starter(html_text: str) -> str:
     m = re.search(r'data-author="([^"]+)"', html_text)
     if m:
@@ -1287,8 +1303,14 @@ def archive(args: argparse.Namespace) -> int:
         p.is_op = bool(thread.starter) and p.author == thread.starter
 
     if not all_posts:
-        warn("не нашёл ни одного поста — возможно, разметка форума изменилась "
-             "или страница требует вход. Загляните в raw/page-001.html")
+        if looks_blocked(first_text):
+            warn("форум отдал страницу-заглушку антибота (Cloudflare), а не тред.")
+            warn("варианты: --cookies 'xf_user=…' из браузера, --delay 5,")
+            warn("          либо --source wayback (снимки web.archive.org).")
+        else:
+            warn("не нашёл ни одного поста: страница не похожа на тред XenForo "
+                 "(нужен вход?) или вёрсткафорума изменилась.")
+            warn("загляните в raw/page-001.html и в archiver.log рядом с ним.")
         return 3
 
     # 3. картинки
@@ -1389,7 +1411,8 @@ def build_argparser() -> argparse.ArgumentParser:
         description="Локальная офлайн-копия треда XenForo (AAR с форума Paradox).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("Примеры:")[-1].split("Назначение")[0])
-    ap.add_argument("thread", help="URL треда")
+    ap.add_argument("thread", nargs="?", default="",
+                    help="URL треда (при запуске без аргументов скрипт спросит его сам)")
     ap.add_argument("-o", "--out", default="out", help="папка для копии (default: out)")
     ap.add_argument("--pages", default="", help="например 1-5 или 1,3,7-9")
     ap.add_argument("--max-pages", type=int, default=0, help="не идти дальше этой страницы")
@@ -1416,17 +1439,125 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--cookies", default="", help="строка куки: 'xf_user=...; other=...'")
     ap.add_argument("--cookie-file", default="", help="файл куки в формате Netscape")
     ap.add_argument("--quiet", action="store_true", help="меньше сообщений")
+    ap.add_argument("--no-log", action="store_true",
+                    help="не писать archiver.log в папку результата")
     ap.add_argument("--version", action="version", version="aar_archiver " + VERSION)
     return ap
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_argparser().parse_args(argv)
+class Tee:
+    """Дублирует вывод в файл, чтобы сообщение не потерялось вместе с окном."""
+
+    def __init__(self, stream, path: Optional[str]) -> None:
+        self.stream = stream
+        self.fh = None
+        if path:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                self.fh = open(path, "a", encoding="utf-8")
+                self.fh.write("\n=== запуск %s ===\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            except OSError:
+                self.fh = None
+
+    def write(self, data):
+        self.stream.write(data)
+        if self.fh:
+            try:
+                self.fh.write(data)
+                self.fh.flush()
+            except OSError:
+                pass
+        return len(data)
+
+    def flush(self):
+        self.stream.flush()
+        if self.fh:
+            try:
+                self.fh.flush()
+            except OSError:
+                pass
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    def close(self):
+        if self.fh:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+
+
+def interactive_args() -> List[str]:
+    """Запуск двойным кликом: спрашиваем URL, а не роняемся с ошибкой argparse."""
+    print("=" * 68)
+    print(" aar_archiver — офлайн-копия AAR-треда с форума Paradox")
+    print("=" * 68)
+    print()
     try:
-        return archive(args)
-    except KeyboardInterrupt:
-        log("\nПрервано пользователем")
-        return 130
+        url = input("Вставьте ссылку на тред и нажмите Enter:\n> ").strip().strip('"')
+    except (EOFError, KeyboardInterrupt):
+        return []
+    if not url:
+        return []
+    rest = input("Дополнительные флаги (можно просто Enter, например: --op-only --epub):\n> ").strip()
+    argv = [url, "--epub"]
+    argv.extend(rest.split() if rest else [])
+    return argv
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = build_argparser()
+    own_argv = argv is None
+    if own_argv and len(sys.argv) == 1 and sys.stdin.isatty():
+        argv = interactive_args()
+    args = ap.parse_args(argv)
+    if not (args.thread or "").strip():
+        ap.print_help()
+        print("\nНе указана ссылка на тред. Пример:\n  python3 aar_archiver.py %s"
+              % "https://forum.paradoxplaza.com/forum/threads/<slug>.<id>/")
+        return pause_on_exit(1, quiet=args.quiet)
+    tee_out = tee_err = None
+    if not args.no_log:
+        log_path = os.path.join(os.path.abspath(args.out), "archiver.log")
+        tee_out, tee_err = sys.stdout, sys.stderr
+        sys.stdout = Tee(tee_out, log_path)
+        sys.stderr = Tee(tee_err, log_path)
+    try:
+        try:
+            rc = archive(args)
+        except KeyboardInterrupt:
+            log("\nПрервано пользователем")
+            rc = 130
+        except Exception as exc:  # не даем окну закрыться без внятного сообщения
+            warn("сбой: %s: %s" % (type(exc).__name__, exc))
+            rc = 4
+    finally:
+        if tee_out is not None:
+            sys.stdout.close()
+            sys.stderr.close()
+            sys.stdout, sys.stderr = tee_out, tee_err
+    if own_argv:
+        rc = pause_on_exit(rc, quiet=args.quiet)
+    return rc
+
+
+def pause_on_exit(rc: int, quiet: bool = False) -> int:
+    """В Windows окно консоли закрывается мгновенно — задерживаем его."""
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive or quiet:
+        return rc
+    if rc == 0 and os.name != "nt":
+        return rc
+    try:
+        print()
+        input("Нажмите Enter, чтобы закрыть окно…")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return rc
 
 
 if __name__ == "__main__":

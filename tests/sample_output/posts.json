@@ -1,0 +1,77 @@
+{
+ "thread": {
+  "url": "https://forum.example.test/forum/threads/sample-realm-diary.900101/",
+  "title": "Sample Realm Diary - an Economic Test AAR",
+  "thread_id": "900101",
+  "starter": "SampleAuthor",
+  "last_page": 3,
+  "archived_at": 1792921637.5372221,
+  "archiver_version": "1.0.0"
+ },
+ "posts": [
+  {
+   "index": 1,
+   "post_id": "900101",
+   "author": "SampleAuthor",
+   "date": "2024-05-01T10:00:00+0000",
+   "page": 1,
+   "is_op": true,
+   "images": [
+    "images/a78dff3a5bf8-county_view.png"
+   ],
+   "html": "\n                <span style=\"font-size: 22px\"><b>Introduction</b></span><br />\n                <br />\n                This is a <b>synthetic</b> fixture used to test the archiver. It contains\n                <i>italic</i>, <u>underline</u> and <s>struck</s> text plus a\n                <a href=\"https://example.org/target\" rel=\"noopener\">plain link</a>.<br />\n                <br />\n                <img src=\"images/a78dff3a5bf8-county_view.png\" alt=\"county_view.png\" loading=\"lazy\" /><br />\n                <br />\n                <ul class=\"bbCodeList\">\n                  <li>Realm size: 14</li>\n                  <li>Yearly income: 7.47</li>\n                  <li>Cities: 0</li>\n                </ul>\n                <br />\n                <div class=\"bbCodeBlock bbCodeBlock--spoiler bbCodeSpoiler\">\n                  \n                  <div class=\"bbCodeSpoiler-content\"><div class=\"bbWrapper\">Hidden spoiler text.</div></div>\n                </div>\n                <br />\n                <div class=\"bbCodeBlock bbCodeBlock--quote\">\n                  <blockquote class=\"bbCodeBlock-content\"><div class=\"bbQuote\">\n                    <div class=\"bbQuoteBanner\">Someone said:</div>\n                    <div class=\"bbQuoteContent\"><div class=\"bbWrapper\">Quoted reply text.</div></div>\n                  </div></blockquote>\n                </div>\n                <br />\n                <div class=\"bbCodeBlock bbCodeBlock--code\"><pre><code>gold = 61<br />prosperity = 1</code></pre></div>\n              ",
+   "markdown": "### Introduction\n\nThis is a **synthetic** fixture used to test the archiver. It contains *italic*, <u>underline</u> and ~~struck~~ text plus a [plain link](https://example.org/target).\n\n![county_view.png](images/a78dff3a5bf8-county_view.png)\n\n- Realm size: 14\n- Yearly income: 7.47\n- Cities: 0\n\n> **Spoiler**\n> Hidden spoiler text.\n\n> Someone said:\n>\n> Quoted reply text.\n\n```\ngold = 61\nprosperity = 1\n```\n"
+  },
+  {
+   "index": 2,
+   "post_id": "900102",
+   "author": "SomeReplier",
+   "date": "2024-05-02T12:30:00+0000",
+   "page": 1,
+   "is_op": false,
+   "images": [],
+   "html": "A short reply that --op-only should drop.",
+   "markdown": "A short reply that --op-only should drop.\n"
+  },
+  {
+   "index": 3,
+   "post_id": "900201",
+   "author": "SampleAuthor",
+   "date": "2024-06-01T09:00:00+0000",
+   "page": 2,
+   "is_op": true,
+   "images": [
+    "images/515009b21cb6-shot2.png"
+   ],
+   "html": "<span style=\"font-size: 26px\"><b>Update 2</b></span><br /><img src=\"images/515009b21cb6-shot2.png\" alt=\"attachment\" loading=\"lazy\" /><p>Paragraph with <b>bold</b> and an ordered list:</p><ol><li>first item</li><li>second item</li></ol>",
+   "markdown": "## Update 2\n\n![attachment](images/515009b21cb6-shot2.png)\n\nParagraph with **bold** and an ordered list:\n\n1. first item\n2. second item\n"
+  },
+  {
+   "index": 4,
+   "post_id": "900202",
+   "author": "AnotherReplier",
+   "date": "2024-06-02T09:00:00+0000",
+   "page": 2,
+   "is_op": false,
+   "images": [],
+   "html": "Reply number two.",
+   "markdown": "Reply number two.\n"
+  },
+  {
+   "index": 5,
+   "post_id": "900301",
+   "author": "SampleAuthor",
+   "date": "2024-07-01T09:00:00+0000",
+   "page": 3,
+   "is_op": true,
+   "images": [],
+   "html": "<div>Final entry.</div><table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>",
+   "markdown": "Final entry.\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+  }
+ ],
+ "images": {
+  "https://i.example.org/shots/county_view.png": "images/a78dff3a5bf8-county_view.png",
+  "https://forum.example.test/forum/attachments/shot2.12345/": "images/515009b21cb6-shot2.png"
+ },
+ "failed_images": []
+}
