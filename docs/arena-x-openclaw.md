@@ -122,7 +122,7 @@ Telegram  ──►  OpenClaw Gateway  ──►  tasks/inbox/TASK-042.md  (git 
 | Ollama локально (`qwen3:32b`, `llama3.3`) | 0 ₽ навсегда, приватно, работает без сети | нужен GPU/32–64 ГБ RAM, качество ниже |
 
 Готовая конфигурация с fallback-цепочкой, hardening и без типичных ошибок — в
-[`openclaw/openclaw.arena.json5`](../openclaw/openclaw.arena.json5). Три грабли, на которые все наступают:
+[`openclaw/openclaw.json`](../openclaw/openclaw.json). Три грабли, на которые все наступают:
 
 1. **Ollama: не добавлять `/v1`** к `baseUrl`. `/v1` включает OpenAI-compat режим, и tool-calling
    ломается — модель начинает печатать JSON вызова инструмента текстом
@@ -133,6 +133,10 @@ Telegram  ──►  OpenClaw Gateway  ──►  tasks/inbox/TASK-042.md  (git 
    ней) и в `agents.defaults.model.primary` как `<id>/<model-id>`.
 
 Проверка: `openclaw models status --probe`, затем `openclaw agent --message "скажи ок"`.
+
+Если железо слабое или ноутбук не работает круглосуточно — смотри
+[`hosting-4gb-colab.md`](./hosting-4gb-colab.md): что делать с 4 ГБ ОЗУ, почему Colab не станет
+сервером и как использовать Drive для бэкапов.
 
 ---
 
@@ -192,7 +196,7 @@ OpenClaw по умолчанию осторожен (bind loopback, auth обя�
 - Данные, уходящие в бесплатные API, — это данные, уходящие в бесплатные API. Пароли и ключи
   храни в `SecretRef`/env, а не в `openclaw.json`.
 
-Готовый hardened-блок уже включён в `openclaw/openclaw.arena.json5`.
+Готовый hardened-блок уже включён в `openclaw/openclaw.json`.
 
 ---
 
@@ -200,7 +204,7 @@ OpenClaw по умолчанию осторожен (bind loopback, auth обя�
 
 1. Скопируй конфиг и подставь ключи:
    ```bash
-   cp openclaw/openclaw.arena.json5 ~/.openclaw/openclaw.json5
+   cp openclaw/openclaw.json ~/.openclaw/openclaw.json
    # пропиши GEMINI_API_KEY / GROQ_API_KEY в ~/.openclaw/.env или env.vars
    openclaw doctor && openclaw models status --probe
    ```

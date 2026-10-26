@@ -1,7 +1,10 @@
-// ~/.openclaw/openclaw.json5
+// ~/.openclaw/openclaw.json
 // Шаблон: «бесплатный мозг 24/7 + hardened gateway».
 // Заменяй <...> своими значениями. Точные id провайдеров/моделей проверяй командой:
 //     openclaw models list
+// Гейтвей сам по себе лёгкий (~200-400 МБ), поэтому слабое железо — не проблема.
+// Локальные модели здесь не обязательны: free-tier API + fallback работают лучше,
+// чем 8B на CPU. Подробнее: docs/hosting-4gb-colab.md
 // Перед применением: openclaw doctor --fix && openclaw gateway restart
 {
   gateway: {
